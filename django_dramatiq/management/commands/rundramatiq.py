@@ -2,6 +2,7 @@ import importlib
 import multiprocessing
 import os
 import pkgutil
+import subprocess
 import sys
 
 from django.apps import apps
@@ -77,9 +78,13 @@ class Command(BaseCommand):
             action="append", dest="forks", default=[],
             help="fork a subprocess to run the given function",
         )
+        parser.add_argument(
+            "--worker-shutdown-timeout", type=int, default=600000,
+            help="timeout for worker shutdown, in milliseconds (default: 10 minutes)"
+        )
 
     def handle(self, use_watcher, use_polling_watcher, use_gevent, path, processes, threads, verbosity, queues,
-               pid_file, log_file, forks, **options):
+               pid_file, log_file, forks, worker_shutdown_timeout, **options):
         executable_name = "dramatiq-gevent" if use_gevent else "dramatiq"
         executable_path = self._resolve_executable(executable_name)
         watch_args = ["--watch", "."] if use_watcher else []
@@ -89,7 +94,7 @@ class Command(BaseCommand):
         forks_args = []
         if forks:
             for function in forks:
-                forks_args += ['--fork-function', function]
+                forks_args += ["--fork-function", function]
 
         verbosity_args = ["-v"] * (verbosity - 1)
         tasks_modules = self.discover_tasks_modules()
@@ -98,6 +103,7 @@ class Command(BaseCommand):
             "--path", *path,
             "--processes", str(processes),
             "--threads", str(threads),
+            "--worker-shutdown-timeout", str(worker_shutdown_timeout),
 
             # --watch /path/to/project [--watch-use-polling]
             *watch_args,
@@ -122,17 +128,46 @@ class Command(BaseCommand):
             process_args.extend(["--log-file", log_file])
 
         self.stdout.write(' * Running dramatiq: "%s"\n\n' % " ".join(process_args))
+
+        if sys.platform == "win32":
+            command = [executable_path] + process_args[1:]
+            sys.exit(subprocess.run(command))
+
         os.execvp(executable_path, process_args)
 
     def discover_tasks_modules(self):
+        task_module_names = getattr(settings, "DRAMATIQ_AUTODISCOVER_MODULES", ("tasks",))
         ignored_modules = set(getattr(settings, "DRAMATIQ_IGNORED_MODULES", []))
-        app_configs = (c for c in apps.get_app_configs() if module_has_submodule(c.module, "tasks"))
+        app_configs = []
+        for conf in apps.get_app_configs():
+            # Always find our own tasks, regardless of the configured module names.
+            if conf.name == "django_dramatiq":
+                app_configs.append((conf, "tasks"))
+            else:
+                for task_module in task_module_names:
+                    if module_has_submodule(conf.module, task_module):
+                        app_configs.append((conf, task_module))
         tasks_modules = ["django_dramatiq.setup"]
 
-        for conf in app_configs:
-            module = conf.name + ".tasks"
+        def is_ignored_module(module_name):
+            if not ignored_modules:
+                return False
 
-            if module in ignored_modules:
+            if module_name in ignored_modules:
+                return True
+
+            name_parts = module_name.split(".")
+
+            for c in range(1, len(name_parts)):
+                part_name = ".".join(name_parts[:c]) + ".*"
+                if part_name in ignored_modules:
+                    return True
+
+            return False
+
+        for conf, task_module in app_configs:
+            module = conf.name + "." + task_module
+            if is_ignored_module(module):
                 self.stdout.write(" * Ignored tasks module: %r" % module)
                 continue
 
@@ -144,7 +179,7 @@ class Command(BaseCommand):
                 submodules = self._get_submodules(imported_module)
 
                 for submodule in submodules:
-                    if submodule in ignored_modules:
+                    if is_ignored_module(submodule):
                         self.stdout.write(" * Ignored tasks module: %r" % submodule)
                     else:
                         self.stdout.write(" * Discovered tasks module: %r" % submodule)
@@ -153,8 +188,7 @@ class Command(BaseCommand):
         return tasks_modules
 
     def _is_package(self, module):
-        module_path = getattr(module, "__path__", None)
-        return module_path and os.path.isdir(module_path[0])
+        return hasattr(module, "__path__")
 
     def _get_submodules(self, package):
         submodules = []
@@ -162,19 +196,15 @@ class Command(BaseCommand):
         package_path = package.__path__
         prefix = package.__name__ + "."
 
-        for _, module_name, is_pkg in pkgutil.walk_packages(package_path, prefix):
-            if is_pkg:
-                sub_submodules = self._get_submodules(importlib.import_module(module_name))
-                submodules.extend(sub_submodules)
-            else:
-                submodules.append(module_name)
+        for _, module_name, _ in pkgutil.walk_packages(package_path, prefix):
+            submodules.append(module_name)
 
         return submodules
 
     def _resolve_executable(self, exec_name):
         bin_dir = os.path.dirname(sys.executable)
         if bin_dir:
-            for d in [bin_dir, os.path.join(bin_dir, 'Scripts')]:
+            for d in [bin_dir, os.path.join(bin_dir, "Scripts")]:
                 exec_path = os.path.join(d, exec_name)
                 if os.path.isfile(exec_path):
                     return exec_path

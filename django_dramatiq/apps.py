@@ -1,206 +1,123 @@
-import importlib
-import multiprocessing
-import os
-import pkgutil
-import subprocess
-import sys
-
-from django.apps import apps
+import dramatiq
+from django.apps import AppConfig
 from django.conf import settings
-from django.core.management.base import BaseCommand
-from django.utils.module_loading import module_has_submodule
+from django.utils.module_loading import import_string
+from dramatiq.results import Results
 
-#: The number of available CPUs.
-CPU_COUNT = multiprocessing.cpu_count()
+from .utils import load_middleware
+
+DEFAULT_ENCODER = "dramatiq.encoder.JSONEncoder"
+
+DEFAULT_BROKER = "dramatiq.brokers.rabbitmq.RabbitmqBroker"
+DEFAULT_BROKER_SETTINGS = {
+    "BROKER": DEFAULT_BROKER,
+    "OPTIONS": {
+        "host": "127.0.0.1",
+        "port": 5672,
+        "heartbeat": 0,
+        "connection_attempts": 5,
+    },
+    "MIDDLEWARE": [
+        "dramatiq.middleware.Prometheus",
+        "dramatiq.middleware.AgeLimit",
+        "dramatiq.middleware.TimeLimit",
+        "dramatiq.middleware.Callbacks",
+        "dramatiq.middleware.Retries",
+        "django_dramatiq.middleware.AdminMiddleware",
+        "django_dramatiq.middleware.DbConnectionsMiddleware",
+    ]
+}
+
+RATE_LIMITER_BACKEND = None
 
 
-class Command(BaseCommand):
-    help = "Runs Dramatiq workers."
+class DjangoDramatiqConfig(AppConfig):
+    name = "django_dramatiq"
+    verbose_name = "Django Dramatiq"
 
-    def add_arguments(self, parser):
-        parser.add_argument(
-            "--reload",
-            action="store_true",
-            dest="use_watcher",
-            help="Enable autoreload.",
-        )
-        parser.add_argument(
-            "--reload-use-polling",
-            action="store_true",
-            dest="use_polling_watcher",
-            help=(
-                "Use a poll-based file watcher for autoreload (useful under "
-                "Vagrant and Docker for Mac)."
-            ),
-        )
-        parser.add_argument(
-            "--use-gevent",
-            action="store_true",
-            help="Use gevent for worker concurrency.",
-        )
-        parser.add_argument(
-            "--processes", "-p",
-            default=CPU_COUNT,
-            type=int,
-            help="The number of processes to run (default: %d)." % CPU_COUNT,
-        )
-        parser.add_argument(
-            "--threads", "-t",
-            default=CPU_COUNT,
-            type=int,
-            help="The number of threads per process to use (default: %d)." % CPU_COUNT,
-        )
-        parser.add_argument(
-            "--path", "-P",
-            default=".",
-            nargs="*",
-            type=str,
-            help="The import path (default: .).",
-        )
-        parser.add_argument(
-            "--queues", "-Q",
-            nargs="*",
-            type=str,
-            help="listen to a subset of queues (default: all queues)",
-        )
-        parser.add_argument(
-            "--pid-file",
-            type=str,
-            help="write the PID of the master process to a file (default: no pid file)",
-        )
-        parser.add_argument(
-            "--log-file",
-            type=str,
-            help="write all logs to a file (default: sys.stderr)",
-        )
-        parser.add_argument(
-            "--fork-function",
-            action="append", dest="forks", default=[],
-            help="fork a subprocess to run the given function",
-        )
+    @classmethod
+    def initialize(cls):
+        global RATE_LIMITER_BACKEND
+        dramatiq.set_encoder(cls.select_encoder())
 
-    def handle(self, use_watcher, use_polling_watcher, use_gevent, path, processes, threads, verbosity, queues,
-               pid_file, log_file, forks, **options):
-        executable_name = "dramatiq-gevent" if use_gevent else "dramatiq"
-        executable_path = self._resolve_executable(executable_name)
-        watch_args = ["--watch", "."] if use_watcher else []
-        if watch_args and use_polling_watcher:
-            watch_args.append("--watch-use-polling")
+        result_backend_settings = cls.result_backend_settings()
+        if result_backend_settings:
+            result_backend_path = result_backend_settings.get("BACKEND", "dramatiq.results.backends.StubBackend")
+            result_backend_class = import_string(result_backend_path)
+            result_backend_options = result_backend_settings.get("BACKEND_OPTIONS", {})
+            result_backend = result_backend_class(**result_backend_options)
 
-        forks_args = []
-        if forks:
-            for function in forks:
-                forks_args += ["--fork-function", function]
+            results_middleware_options = result_backend_settings.get("MIDDLEWARE_OPTIONS", {})
+            results_middleware = Results(backend=result_backend, **results_middleware_options)
+        else:
+            result_backend = None
+            results_middleware = None
 
-        verbosity_args = ["-v"] * (verbosity - 1)
-        tasks_modules = self.discover_tasks_modules()
-        process_args = [
-            executable_name,
-            "--path", *path,
-            "--processes", str(processes),
-            "--threads", str(threads),
+        rate_limiter_backend_settings = cls.rate_limiter_backend_settings()
+        if rate_limiter_backend_settings:
+            rate_limiter_backend_path = rate_limiter_backend_settings.get(
+                "BACKEND", "dramatiq.rate_limits.backends.stub.StubBackend"
+            )
+            rate_limiter_backend_class = import_string(rate_limiter_backend_path)
+            rate_limiter_backend_options = rate_limiter_backend_settings.get("BACKEND_OPTIONS", {})
+            RATE_LIMITER_BACKEND = rate_limiter_backend_class(**rate_limiter_backend_options)
 
-            # --watch /path/to/project [--watch-use-polling]
-            *watch_args,
-
-            # [--fork-function import.path.function]*
-            *forks_args,
-
-            # -v -v ...
-            *verbosity_args,
-
-            # django_dramatiq.tasks app1.tasks app2.tasks ...
-            *tasks_modules,
+        broker_settings = cls.broker_settings()
+        broker_path = broker_settings["BROKER"]
+        broker_class = import_string(broker_path)
+        broker_options = broker_settings.get("OPTIONS", {})
+        middleware = [
+            load_middleware(path, **cls.get_middleware_kwargs(path))
+            for path in broker_settings.get("MIDDLEWARE", [])
         ]
 
-        if queues:
-            process_args.extend(["--queues", *queues])
+        if result_backend is not None:
+            middleware.append(results_middleware)
 
-        if pid_file:
-            process_args.extend(["--pid-file", pid_file])
+        broker = broker_class(middleware=middleware, **broker_options)
+        dramatiq.set_broker(broker)
 
-        if log_file:
-            process_args.extend(["--log-file", log_file])
+    @property
+    def rate_limiter_backend(self):
+        return type(self).get_rate_limiter_backend()
 
-        self.stdout.write(' * Running dramatiq: "%s"\n\n' % " ".join(process_args))
+    @classmethod
+    def get_rate_limiter_backend(cls):
+        global RATE_LIMITER_BACKEND
+        if RATE_LIMITER_BACKEND is None:
+            raise RuntimeError("The rate limiter backend has not been configured.")
 
-        if sys.platform == "win32":
-            command = [executable_path] + process_args[1:]
-            sys.exit(subprocess.run(command))
+        return RATE_LIMITER_BACKEND
 
-        os.execvp(executable_path, process_args)
+    @classmethod
+    def get_middleware_kwargs(cls, path):
+        if isinstance(path, str):
+            middleware_path = path.rsplit(".", 1)[1].lower()
+            middleware_kwargs_method = "middleware_{}_kwargs".format(middleware_path)
+            if hasattr(cls, middleware_kwargs_method):
+                return getattr(cls, middleware_kwargs_method)()
+        return {}
 
-    def discover_tasks_modules(self):
-        task_module_names = getattr(settings, "DRAMATIQ_AUTODISCOVER_MODULES", ("tasks",))
-        ignored_modules = set(getattr(settings, "DRAMATIQ_IGNORED_MODULES", []))
-        app_configs = []
-        for conf in apps.get_app_configs():
-            # Always find our own tasks, regardless of the configured module names.
-            if conf.name == "django_dramatiq":
-                app_configs.append((conf, "tasks"))
-            else:
-                for task_module in task_module_names:
-                    if module_has_submodule(conf.module, task_module):
-                        app_configs.append((conf, task_module))
-        tasks_modules = ["django_dramatiq.setup"]
+    @classmethod
+    def broker_settings(cls):
+        return getattr(settings, "DRAMATIQ_BROKER", DEFAULT_BROKER_SETTINGS)
 
-        def is_ignored_module(module_name):
-            if not ignored_modules:
-                return False
+    @classmethod
+    def result_backend_settings(cls):
+        return getattr(settings, "DRAMATIQ_RESULT_BACKEND", {})
 
-            if module_name in ignored_modules:
-                return True
+    @classmethod
+    def rate_limiter_backend_settings(cls):
+        return getattr(settings, "DRAMATIQ_RATE_LIMITER_BACKEND", {})
 
-            name_parts = module_name.split(".")
+    @classmethod
+    def tasks_database(cls):
+        return getattr(settings, "DRAMATIQ_TASKS_DATABASE", "default")
 
-            for c in range(1, len(name_parts)):
-                part_name = ".".join(name_parts[:c]) + ".*"
-                if part_name in ignored_modules:
-                    return True
+    @classmethod
+    def select_encoder(cls):
+        encoder = getattr(settings, "DRAMATIQ_ENCODER", DEFAULT_ENCODER)
+        return import_string(encoder)()
 
-            return False
 
-        for conf, task_module in app_configs:
-            module = conf.name + "." + task_module
-            if is_ignored_module(module):
-                self.stdout.write(" * Ignored tasks module: %r" % module)
-                continue
-
-            imported_module = importlib.import_module(module)
-            if not self._is_package(imported_module):
-                self.stdout.write(" * Discovered tasks module: %r" % module)
-                tasks_modules.append(module)
-            else:
-                submodules = self._get_submodules(imported_module)
-
-                for submodule in submodules:
-                    if is_ignored_module(submodule):
-                        self.stdout.write(" * Ignored tasks module: %r" % submodule)
-                    else:
-                        self.stdout.write(" * Discovered tasks module: %r" % submodule)
-                        tasks_modules.append(submodule)
-
-        return tasks_modules
-
-    def _is_package(self, module):
-        return hasattr(module, "__path__")
-
-    def _get_submodules(self, package):
-        submodules = []
-
-        package_path = package.__path__
-        prefix = package.__name__ + "."
-
-        for _, module_name, _ in pkgutil.walk_packages(package_path, prefix):
-            submodules.append(module_name)
-
-        return submodules
-
-    def _resolve_executable(self, exec_name):
-        bin_dir = os.path.dirname(sys.executable)
-        if bin_dir:
-            for d in [bin_dir, os.path.join(bin_dir, "Scripts")]:
-                exec_path = os.path.join(d, exec_name)
-                if os.path.isfile(exec_path):
-                    return exec_path
-        return exec_name
+DjangoDramatiqConfig.initialize()
